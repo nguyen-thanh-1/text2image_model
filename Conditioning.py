@@ -272,22 +272,19 @@ class ConditionalUNet(UNet):
     '''
 
 # -------------------- Text Encoder Wrapper --------------------
-
+'''
+- Wrapper download tokenizer + CLIP text encoder (HuggingFace)
+- Encode one batch of prompts into input_ids and sequence token embeddings (seq_emb) to use for cross-attention in ConditionalUNet
+'''
 class CLIPTextEmbedder(nn.Module):
-    """
-    Wrapper around HuggingFace CLIP-L/14 text encoder to produce token embeddings
-    for cross-attention in Conditional UNet.
-
-    - Input: list of strings (texts).
-    - Output: 
-        * input_ids (LongTensor) [B, L]
-        * seq_emb (FloatTensor) [B, L, 768]  (sequence embeddings, not pooled)
-
-    Notes:
-    - We use 'openai/clip-vit-large-patch14' with hidden_size=768.
-    - The model is frozen by default (eval mode, no grad).
-    """
-
+    '''
+    @input:
+        - pretrained: name model/tokenizer HF
+        - device: optional
+    @function:
+        - Downloading tokenizer and text encoder pretrained, preparing for encode text into token IDs and embedding that UNet use as the context for cross-attention
+        - using freezed model to save memory and keep weights constant (no fune-tune following by default)
+    '''
     def __init__(self, 
                  pretrained: str = "openai/clip-vit-large-patch14", 
                  device: Optional[torch.device] = None):
@@ -299,24 +296,24 @@ class CLIPTextEmbedder(nn.Module):
         self.model = CLIPTextModel.from_pretrained(pretrained).to(self.device)
         self.text_emb_dim = self.model.config.hidden_size  # = 768 for CLIP-L/14
 
-        # freeze text encoder
-        self.model.eval()
+        # freeze text encoder 
+        self.model.eval() # set inference mode (turn off dropout) 
         for p in self.model.parameters():
             p.requires_grad = False
-
+    '''
+    @input:
+        - texts: batch of prompts
+        - max_length: maximum length of sequence
+    @output:
+        - input_ids: (B, L) (L: max length in batch after padding, <= max_length)
+        - seq_emb: (B, L, D) (D = self.text_emb_dim)
+    @function:
+        - list text will be converted token IDs (padding/truncation) and running encoder to take sequence token embeddings
+        - These embeddings will be contexts for corss-attention (B, L, D)
+    '''
     @torch.no_grad()
     def encode(self, texts: List[str], max_length: int = 77) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Encode list of texts into token IDs and sequence embeddings.
 
-        Args:
-            texts: list[str], batch of text prompts.
-            max_length: int, maximum sequence length (default 77).
-
-        Returns:
-            input_ids: LongTensor [B, L]
-            seq_emb: FloatTensor [B, L, 768]
-        """
         toks = self.tokenizer(
             texts, 
             padding="longest", 
@@ -332,32 +329,63 @@ class CLIPTextEmbedder(nn.Module):
             attention_mask=attention_mask, 
             output_hidden_states=False
         )
-        seq_emb = out.last_hidden_state  # [B, L, 768]
+        seq_emb = out.last_hidden_state  # [B, L, D]
         return input_ids, seq_emb
 
 
 # -------------------- Classifier-free Guidance helpers --------------------
+'''
+- Used to implement a simple form of classifier-free guidance training
+- Aim: during training, apart of batch will be trained with uncondition (untext) to enable classifier-free guidance when sampling
+'''
 
+'''
+@input:
+    - seq_emb: sequence embeddings (B=batch sise, L=sequence length, D=text embedding dim)
+    - keep_prob: keep probability context
+@output:
+    optional
+        - None: when deciding drop all context for batch (unconditioned)
+        - seq_emb (origin): when keep context (conditioned)
+'''
 def maybe_mask_context(seq_emb: torch.Tensor, keep_prob: float = 0.9) -> Optional[torch.Tensor]:
-    """With probability (1-keep_prob) return None (unconditioned). For classifier-free guidance we
-    train on some fraction of unconditioned samples by providing empty context.
-    Note: here we expect seq_emb already as (B, L, D). We'll return None for all in a batch when dropping.
-    For more fine-grained dropout, you can mix conditioned/unconditioned within batch.
-    """
+  
     if torch.rand(1).item() < (1.0 - keep_prob):
         return None
     return seq_emb
 
 
 # -------------------- Conditional Diffusion wrapper --------------------
-
+'''
+- conditionalGaussianDiffusion has additional capability about text conditioning by using text_embedding (CLIP)
+- support classifier-freee guidance in sample_with_guidance
+- loss_fn: implement dropout condition per-sample
+'''
 class ConditionalGaussianDiffusion(GaussianDiffusion):
+    '''
+    @input:
+        - model: Conditional UNet
+        - text_embedder: instance CLIPTextEmbedder - using to encode prompts
+        - **kwargs: forward to parameters of GaussianDiffusion.__init__(...)
+    '''
     def __init__(self, model: nn.Module, text_embedder: CLIPTextEmbedder, **kwargs):
         super().__init__(model=model, **kwargs)
         self.text_embedder = text_embedder
 
+    '''
+    @input:
+        - x_t: (B, C, H, W)
+        - t: (B,)
+        - context: (B, L, D) or None
+    @output:
+        - mean_pred: (B, C, H, W) - mean of approximated reverse distribution p(theta)(xt-1|xt)
+        - var: (B, 1, 1, 1) broadcastable - posterior variance beta^t (from scheduler)
+    @function:
+        - using model to predict noise eps(theta)(xt, t, context) -> recreate x^0
+        - Calculate mean & variance of p(xt-1|xt) following DDPM formula
+    '''
     def p_mean_variance(self, x_t: torch.Tensor, t: torch.Tensor, context: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Model signature: model(x_t, t, context)
+        
         eps_pred = self.model(x_t, t, context)
         x0_pred = (self.sqrt_recip_alphas_cumprod[t].view(-1, 1, 1, 1) * x_t -
                    self.sqrt_recipm1_alphas_cumprod[t].view(-1, 1, 1, 1) * eps_pred)
@@ -369,19 +397,38 @@ class ConditionalGaussianDiffusion(GaussianDiffusion):
         var = self.posterior_variance[t].view(-1, 1, 1, 1)
         return mean_pred, var
 
+    '''
+    @output:
+        - x{t-1}: (B< C< H, W - sampled previous step
+    @function: 
+        - calculate mean, var --> take sample x(t-1) ~ N(mean, var)
+    @formular:
+        x(t-1) = mi + sqrt(var).z , z ~ N(0,I)
+    '''
     def p_sample(self, x_t: torch.Tensor, t: torch.Tensor, context: Optional[torch.Tensor] = None) -> torch.Tensor:
         mean, var = self.p_mean_variance(x_t, t, context)
         if t[0] == 0:
             return mean
         noise = torch.randn_like(x_t)
-        return mean + torch.sqrt(var) * noise
+        return mean + torch.sqrt(var) * noise #
 
+    '''
+    @input:
+        - batch_size: number of image that is generated
+        - context_texts: list prompts. Length should match batch_size
+        - guidance_scale: classifier-free guidance weight w 
+    @output:
+        - x: (B, C, H, W) - sampled images in final step
+    @function:
+        - Generating batch image with classifier-free guidance: at each step compute eps_cond and eps_uncond
+        - combine them into guided epsilon, and perform ancestral sampling step
+    '''
     def sample_with_guidance(self, batch_size: int, context_texts: list, guidance_scale: float = 5.0, device: Optional[torch.device] = None):
         device = device or self.device
         # encode texts (B, L, D)
         _, context = self.text_embedder.encode(context_texts)
         shape = (batch_size, self.channels, self.image_size, self.image_size)
-        x = torch.randn(shape, device=device)
+        x = torch.randn(shape, device=device) #initialize
         for i in reversed(range(self.timesteps)):
             t = torch.full((batch_size,), i, dtype=torch.long, device=device)
             # classifier-free guidance: run conditioned and unconditioned model and combine
@@ -407,7 +454,17 @@ class ConditionalGaussianDiffusion(GaussianDiffusion):
             else:
                 x = mean + torch.sqrt(var) * torch.randn_like(x)
         return x
-
+    '''
+    @input:
+        - x_start: (B, C, H, W) - clean training images (normalized consistent with model)
+        - captions: length B - text prompts for each training example
+        - cond_drop_prob: probability to drop conditioning for each element (per-element dropout) during training
+    @output:
+        - scalar tensor - MSE loss
+    @function:
+        - creating x_t
+        - compute eps predictions and MSE with ground-true noise
+    '''
     def loss_fn(self, x_start: torch.Tensor, captions: list, cond_drop_prob: float = 0.1) -> torch.Tensor:
         B = x_start.shape[0]
         t = torch.randint(0, self.timesteps, (B,), device=self.device)
